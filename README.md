@@ -101,6 +101,8 @@ openssl rand -base64 32
 
 Paste it as `MCP_MASTER_KEY`. Add your Clerk keys (`pk_test_…` / `sk_test_…`) and set `NEXT_PUBLIC_APP_URL` to the public URL of your deployment (e.g. `https://mcp.example.com` or `http://localhost:3000` for local).
 
+To let `forward_message` work, set `FORWARD_ALLOWLIST` to the addresses (`alice@example.com`) and/or domains (`example.com`) that may receive forwards, comma-separated. Left empty, every forward is refused.
+
 ⚠️ **Losing `MCP_MASTER_KEY` means losing every stored IMAP/SMTP password.** Back it up.
 
 ### 2. Run with Docker
@@ -227,6 +229,7 @@ missing, install it in the container: `docker compose exec app npm i esbuild --n
 | ----------------- | ----------------------------------------------------------------------- |
 | `send_message`    | Send via the account's SMTP, appending the HTML signature and base64 attachments; the sent copy is IMAP-appended to the Sent folder (skipped on Gmail, which saves it automatically). |
 | `reply_message`   | Reply preserving `In-Reply-To` / `References`; same Sent-folder behavior as `send_message`. |
+| `forward_message` | Forward a message to recipients allowed by `FORWARD_ALLOWLIST` (empty = every forward refused). `mode: "inline"` (default) adds a `Fwd:` subject, the comment, the signature, a `---------- Message transféré ----------` header block and the sanitized original body with all its attachments (inline `cid:` images included); `mode: "attachment"` attaches the original as a `.eml` (`message/rfc822`). Does not mark the original as read; same Sent-folder behavior as `send_message`. |
 
 ### Flags & triage
 

@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { simpleParser, type AddressObject, type ParsedMail } from "mailparser";
 import { z } from "zod";
 import type { McpContext } from "./context";
 import {
@@ -14,6 +15,7 @@ import {
   deleteMessages,
   getAttachment,
   getMessage,
+  getMessageSource,
   getThread,
   listFolders,
   listMessages,
@@ -23,7 +25,8 @@ import {
   setMessageFlags,
 } from "@/lib/imap";
 import type { OutgoingAttachment } from "@/lib/smtp";
-import { sendMail } from "@/lib/smtp";
+import { escapeHtml, sanitizeSignatureHtml, sendMail } from "@/lib/smtp";
+import { disallowedForwardRecipients } from "@/lib/forwardAllowlist";
 import { signAttachmentToken } from "@/lib/auth/attachmentToken";
 import { appBaseUrl } from "@/lib/auth/oauth";
 import {
@@ -117,7 +120,7 @@ export function buildMcpServer(ctx: McpContext): McpServer {
     {
       capabilities: { tools: {} },
       instructions:
-        "This server gives access to the current user's registered IMAP email accounts AND their CalDAV calendar accounts.\n\nEMAIL — Call list_accounts first to discover email account IDs; the response carries each account's `writingStyleInstructions`, a pre-rendered directive you MUST follow verbatim when drafting via send_message or reply_message (it covers language, tone, formality, greeting, sign-off, length, emoji policy and custom user rules). IMAP folders are identified by their path; messages by their UID.\n\nCALENDAR — Call list_calendar_accounts to discover calendar account IDs (independent of email accounts), then list_calendars to find calendar collection URLs. Events use ETag-based optimistic concurrency: keep the `etag` returned by list_events / get_event and pass it to update_event / delete_event — a stale etag returns 412 Precondition Failed and you should re-fetch.\n\nTIMEZONES — Every event response carries `start`/`end` (UTC ISO), `startLocal`/`endLocal` (wall-clock when a TZID is set) and `tz` (IANA name, e.g. \"Europe/Paris\", or null when stored as UTC). When creating/updating events, pass `tz` to anchor the event to a real timezone — recurring events then survive DST correctly. For `start`/`end`, pass either a floating local time like \"2026-05-01T10:00:00\" interpreted in the given `tz`, or a zoned/UTC ISO (\"…Z\" / \"…+02:00\") which will be converted to the tz local time. Omit `tz` to store the event in UTC. Recurring events return their raw RRULE; pass expand_recurring=true on list_events to expand individual occurrences within the requested time range.",
+        "This server gives access to the current user's registered IMAP email accounts AND their CalDAV calendar accounts.\n\nEMAIL — Call list_accounts first to discover email account IDs; the response carries each account's `writingStyleInstructions`, a pre-rendered directive you MUST follow verbatim when drafting via send_message, reply_message or forward_message (it covers language, tone, formality, greeting, sign-off, length, emoji policy and custom user rules). IMAP folders are identified by their path; messages by their UID.\n\nCALENDAR — Call list_calendar_accounts to discover calendar account IDs (independent of email accounts), then list_calendars to find calendar collection URLs. Events use ETag-based optimistic concurrency: keep the `etag` returned by list_events / get_event and pass it to update_event / delete_event — a stale etag returns 412 Precondition Failed and you should re-fetch.\n\nTIMEZONES — Every event response carries `start`/`end` (UTC ISO), `startLocal`/`endLocal` (wall-clock when a TZID is set) and `tz` (IANA name, e.g. \"Europe/Paris\", or null when stored as UTC). When creating/updating events, pass `tz` to anchor the event to a real timezone — recurring events then survive DST correctly. For `start`/`end`, pass either a floating local time like \"2026-05-01T10:00:00\" interpreted in the given `tz`, or a zoned/UTC ISO (\"…Z\" / \"…+02:00\") which will be converted to the tz local time. Omit `tz` to store the event in UTC. Recurring events return their raw RRULE; pass expand_recurring=true on list_events to expand individual occurrences within the requested time range.",
     },
   );
 
@@ -369,6 +372,122 @@ export function buildMcpServer(ctx: McpContext): McpServer {
           attachments: toOutgoing(args.attachments),
         });
         return jsonResult(result);
+      } catch (e) {
+        return errorResult(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "forward_message",
+    {
+      title: "Forward message",
+      description:
+        "Forward an existing message. mode=inline (default) quotes the original below a \"---------- Message transféré ----------\" header block (De, Date, Objet, À, Cc) and re-attaches every original attachment, inline cid: images included; mode=attachment sends the original untouched as a .eml (message/rfc822) attachment. comment_text / comment_html is placed above the forwarded content, followed by the HTML signature when include_signature=true. Follow the account's `writingStyleInstructions` from list_accounts when writing the comment. Every recipient (to, cc, bcc) must match the server's FORWARD_ALLOWLIST, otherwise the forward is refused. The original is not marked as read. The forward is IMAP-appended to Sent (skipped on Gmail).",
+      inputSchema: {
+        account_id: z.string().uuid(),
+        folder: z.string(),
+        uid: z.number().int().positive(),
+        to: z.array(z.string().email()).min(1),
+        cc: z.array(z.string().email()).optional(),
+        bcc: z.array(z.string().email()).optional(),
+        comment_text: z.string().optional(),
+        comment_html: z.string().optional(),
+        mode: z.enum(["inline", "attachment"]).default("inline"),
+        include_signature: z.boolean().default(true),
+      },
+    },
+    async (args) => {
+      try {
+        const denied = disallowedForwardRecipients([
+          ...args.to,
+          ...(args.cc ?? []),
+          ...(args.bcc ?? []),
+        ]);
+        if (denied.length) {
+          return errorResult(
+            new Error(
+              `forward refused: recipient(s) not allowed by FORWARD_ALLOWLIST: ${denied.join(", ")}`,
+            ),
+          );
+        }
+
+        const acc = await requireAccount(ctx.userId, args.account_id);
+        const source = await getMessageSource(acc, args.folder, args.uid);
+        if (!source) return errorResult(new Error("original message not found"));
+        // keepCidLinks: leave cid: references in the HTML so they resolve
+        // against the re-attached inline parts instead of data: URIs.
+        const original = await simpleParser(source, { keepCidLinks: true });
+
+        const subject = forwardSubject(original.subject);
+        const signature =
+          args.include_signature && acc.signatureHtml
+            ? sanitizeSignatureHtml(acc.signatureHtml)
+            : null;
+        const commentHtml =
+          args.comment_html ??
+          (args.comment_text
+            ? `<div style="white-space:pre-wrap">${escapeHtml(args.comment_text)}</div>`
+            : "");
+        const headHtml = [commentHtml, signature].filter(Boolean).join("<br/><br/>");
+
+        let text: string | undefined;
+        let html: string | undefined;
+        let attachments: OutgoingAttachment[];
+
+        if (args.mode === "attachment") {
+          text = args.comment_text;
+          html = headHtml || undefined;
+          attachments = [
+            {
+              filename: emlFilename(original.subject),
+              content: source,
+              contentType: "message/rfc822",
+            },
+          ];
+        } else {
+          const fields = forwardHeaderFields(original);
+          text = [
+            args.comment_text ?? "",
+            "",
+            FORWARD_SEPARATOR,
+            ...fields.map(([k, v]) => `${k} : ${v}`),
+            "",
+            original.text ?? "",
+          ].join("\n");
+
+          const block =
+            `<div>${FORWARD_SEPARATOR}<br/>` +
+            fields.map(([k, v]) => `${k} : ${escapeHtml(v)}`).join("<br/>") +
+            "</div><br/>";
+          const body =
+            typeof original.html === "string"
+              ? sanitizeSignatureHtml(original.html)
+              : `<div style="white-space:pre-wrap">${escapeHtml(original.text ?? "")}</div>`;
+          html = `${headHtml ? `${headHtml}<br/><br/>` : ""}${block}${body}`;
+
+          attachments = (original.attachments ?? []).map((a, i) => ({
+            filename: a.filename ?? `attachment-${i + 1}`,
+            content: Buffer.isBuffer(a.content) ? a.content : Buffer.from(a.content as Uint8Array),
+            contentType: a.contentType,
+            contentId: a.cid,
+            isInline: a.contentDisposition === "inline",
+          }));
+        }
+
+        const result = await sendMail(acc, {
+          to: args.to,
+          cc: args.cc,
+          bcc: args.bcc,
+          subject,
+          text,
+          html,
+          // The signature is already placed between the comment and the
+          // forwarded content; sendMail would append it after the original.
+          includeSignature: false,
+          attachments: attachments.length ? attachments : undefined,
+        });
+        return jsonResult({ ...result, mode: args.mode, attachmentCount: attachments.length });
       } catch (e) {
         return errorResult(e);
       }
@@ -1105,4 +1224,41 @@ function extractAddress(field: string): string {
   const m = field.match(/<([^>]+)>/);
   if (m) return m[1];
   return field.trim();
+}
+
+const FORWARD_SEPARATOR = "---------- Message transféré ----------";
+
+function forwardSubject(subject: string | undefined): string {
+  const s = (subject ?? "").trim();
+  if (/^(fwd?|tr)\s*:/i.test(s)) return s;
+  return s ? `Fwd: ${s}` : "Fwd:";
+}
+
+function addressText(field: AddressObject | AddressObject[] | undefined): string {
+  if (!field) return "";
+  return (Array.isArray(field) ? field : [field]).map((a) => a.text).join(", ");
+}
+
+function forwardHeaderFields(msg: ParsedMail): Array<[string, string]> {
+  // Prefer the raw Date header so the sender's timezone is preserved.
+  const rawDate = msg.headerLines
+    .find((h) => h.key === "date")
+    ?.line.replace(/^date:\s*/i, "")
+    .trim();
+  const fields: Array<[string, string]> = [
+    ["De", addressText(msg.from)],
+    ["Date", rawDate || (msg.date ? msg.date.toUTCString() : "")],
+    ["Objet", msg.subject ?? ""],
+    ["À", addressText(msg.to)],
+    ["Cc", addressText(msg.cc)],
+  ];
+  return fields.filter(([, v]) => v);
+}
+
+function emlFilename(subject: string | undefined): string {
+  const base = (subject ?? "")
+    .replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_")
+    .trim()
+    .slice(0, 100);
+  return `${base || "message"}.eml`;
 }
