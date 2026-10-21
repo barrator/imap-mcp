@@ -3,8 +3,27 @@ import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { users } from "@/lib/db/schema";
 
+/**
+ * Optional access allowlist. When ALLOWED_CLERK_USER_IDS is set (comma-separated
+ * Clerk user IDs), any other signed-in Clerk user is rejected before a user row is
+ * created or any account, calendar or OAuth grant is touched. Unset = previous
+ * behaviour (any Clerk user may use the instance).
+ */
+function allowedClerkUserIds(): Set<string> | null {
+  const raw = process.env.ALLOWED_CLERK_USER_IDS?.trim();
+  if (!raw) return null;
+  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+export function signupDisabled(): boolean {
+  return process.env.DISABLE_SIGNUP === "true" || allowedClerkUserIds() !== null;
+}
+
 export async function getClerkUserId(): Promise<string | null> {
   const { userId } = await auth();
+  if (!userId) return null;
+  const allowed = allowedClerkUserIds();
+  if (allowed && !allowed.has(userId)) return null;
   return userId;
 }
 
