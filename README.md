@@ -101,6 +101,8 @@ openssl rand -base64 32
 
 Paste it as `MCP_MASTER_KEY`. Add your Clerk keys (`pk_test_…` / `sk_test_…`) and set `NEXT_PUBLIC_APP_URL` to the public URL of your deployment (e.g. `https://mcp.example.com` or `http://localhost:3000` for local).
 
+To let `forward_message` work, set `FORWARD_ALLOWLIST` — see [Forwarding allowlist](#forwarding-allowlist). Left empty, every forward is refused.
+
 ⚠️ **Losing `MCP_MASTER_KEY` means losing every stored IMAP/SMTP password.** Back it up.
 
 ### 2. Run with Docker
@@ -227,6 +229,7 @@ missing, install it in the container: `docker compose exec app npm i esbuild --n
 | ----------------- | ----------------------------------------------------------------------- |
 | `send_message`    | Send via the account's SMTP, appending the HTML signature and base64 attachments; the sent copy is IMAP-appended to the Sent folder (skipped on Gmail, which saves it automatically). |
 | `reply_message`   | Reply preserving `In-Reply-To` / `References`; same Sent-folder behavior as `send_message`. |
+| `forward_message` | Forward a message to recipients allowed by `FORWARD_ALLOWLIST` (see [Forwarding allowlist](#forwarding-allowlist); empty = every forward refused). `mode: "inline"` (default) adds a `Fwd:` subject, the comment, the signature, a `---------- Forwarded message ----------` header block (From, Date, Subject, To, Cc) and the sanitized original body with all its attachments (inline `cid:` images included); `mode: "attachment"` attaches the original untouched as a `.eml` (`message/rfc822`). Does not mark the original as read; same Sent-folder behavior as `send_message`. |
 
 ### Flags & triage
 
@@ -307,6 +310,24 @@ oauth_auth_codes(code, client_id, user_id, redirect_uri,
 oauth_tokens(id, access_token_hash UNIQUE, refresh_token_hash,
              client_id, user_id, access_expires_at, refresh_expires_at, revoked_at)
 ```
+
+## Forwarding allowlist
+
+`forward_message` can send the full content of a mailbox — body and attachments — to another address, so it is locked down by a server-side allowlist that only the administrator controls (an MCP client cannot change it).
+
+- **Where:** the `FORWARD_ALLOWLIST` environment variable (in `.env` with Docker).
+- **Format:** entries separated by commas, semicolons or whitespace; case-insensitive.
+  - `alice@example.com` — that exact address.
+  - `example.com` or `@example.com` — any address at that domain. Exact domain only: `sub.example.com` is **not** covered and must be listed separately.
+- **Rule:** every recipient in `to`, `cc` **and** `bcc` must match. If one does not, nothing is sent and the tool returns `forward refused: recipient(s) not allowed by FORWARD_ALLOWLIST: …` naming the refused addresses.
+- **Default:** empty or unset = every forward is refused, so the feature is off until you opt in.
+- **Applies to** `forward_message` only; `send_message` and `reply_message` are not affected.
+- **Changing it:** edit `.env`, then `docker compose up -d app` to recreate the container (no rebuild needed).
+- **Tip:** prefer exact addresses; allow a whole domain only when you trust every mailbox on it.
+
+Example:
+
+    FORWARD_ALLOWLIST=accounting@example.com, partner.example.org
 
 ## Security notes
 

@@ -56,13 +56,22 @@ export async function testSmtpConnection(acc: SmtpAccountLike): Promise<void> {
   }
 }
 
-export interface OutgoingAttachment {
+interface OutgoingAttachmentBase {
   filename: string;
-  contentBase64: string;
   contentType?: string;
   contentId?: string;
   isInline?: boolean;
 }
+
+/**
+ * An attachment's bytes come either base64-encoded (what MCP clients send)
+ * or as a raw Buffer (server-side content, e.g. a forwarded message's parts).
+ */
+export type OutgoingAttachment = OutgoingAttachmentBase &
+  (
+    | { contentBase64: string; content?: never }
+    | { content: Buffer; contentBase64?: never }
+  );
 
 export interface SendMailInput {
   to: string[];
@@ -123,7 +132,7 @@ function appendSignature(
   return { text: input.text, html };
 }
 
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -169,13 +178,27 @@ export async function sendMail(
       html,
       inReplyTo: input.inReplyTo,
       references: input.references?.join(" "),
-      attachments: input.attachments?.map((a) => ({
-        filename: a.filename,
-        content: Buffer.from(a.contentBase64, "base64"),
-        contentType: a.contentType,
-        cid: a.contentId,
-        contentDisposition: a.isInline ? "inline" : "attachment",
-      })),
+      attachments: input.attachments?.map((a) => {
+        const content = a.content ?? Buffer.from(a.contentBase64, "base64");
+        return {
+          filename: a.filename,
+          content,
+          contentType: a.contentType,
+          cid: a.contentId,
+          contentDisposition: a.isInline ? "inline" : "attachment",
+          // RFC 2046 §5.2.1: message/* parts must not be base64/QP-encoded,
+          // which is nodemailer's default for attachments. The typings lack
+          // "8bit", so it goes through the header instead.
+          ...(a.contentType && /^message\//i.test(a.contentType)
+            ? {
+                contentTransferEncoding: false as const,
+                headers: {
+                  "Content-Transfer-Encoding": content.some((b) => b > 0x7f) ? "8bit" : "7bit",
+                },
+              }
+            : {}),
+        };
+      }),
     };
 
     // Compose the raw MIME once so we can both feed it to SMTP and APPEND

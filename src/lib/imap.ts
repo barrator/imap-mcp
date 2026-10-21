@@ -184,6 +184,28 @@ export async function getMessage(
   });
 }
 
+/**
+ * Raw RFC 5322 source of a message, as stored on the server. Uses
+ * BODY.PEEK[] under the hood (like getMessage), so the \Seen flag is left
+ * untouched.
+ */
+export async function getMessageSource(
+  acc: AccountLike,
+  folder: string,
+  uid: number,
+): Promise<Buffer | null> {
+  return withImap(acc, async (client) => {
+    const lock = await client.getMailboxLock(folder);
+    try {
+      const msg = await client.fetchOne(String(uid), { source: true }, { uid: true });
+      if (!msg || !msg.source) return null;
+      return msg.source;
+    } finally {
+      lock.release();
+    }
+  });
+}
+
 function addrList(
   field: ParsedMail["to"] | ParsedMail["cc"] | ParsedMail["from"],
 ): string[] {
