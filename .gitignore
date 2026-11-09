@@ -134,5 +134,4 @@ dist
 
 
 # Claude Code local settings (may contain secrets from "always allow" approvals)
-.claude/settings.local.json
-.claude/*.local.*
+.claude/
